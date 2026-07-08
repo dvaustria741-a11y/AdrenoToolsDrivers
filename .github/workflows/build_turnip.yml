@@ -1,0 +1,185 @@
+name: Build Turnip Driver (Adreno 619 - SD695)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mesa_version:
+        description: 'Mesa branch or tag (e.g. main, mesa-24.3.0)'
+        required: false
+        default: 'main'
+      driver_label:
+        description: 'Label suffix for the release (e.g. 2025-07-08)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      ANDROID_NDK_VERSION: r27c
+      MESA_SRC: ${{ github.workspace }}/mesa
+      OUT_DIR: ${{ github.workspace }}/out
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # ── Dependencies ────────────────────────────────────────────────────────
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git python3-pip python3-mako ninja-build cmake \
+            libxml2-dev wget unzip zip curl jq \
+            glslang-tools libclang-dev llvm-dev \
+            bison flex libzstd-dev libdrm-dev \
+            pkg-config ca-certificates
+          pip3 install meson --break-system-packages
+
+      # ── Android NDK ─────────────────────────────────────────────────────────
+      - name: Download Android NDK
+        run: |
+          wget -q "https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip" -O ndk.zip
+          unzip -q ndk.zip -d $HOME
+          echo "NDK_HOME=$HOME/android-ndk-${ANDROID_NDK_VERSION}" >> $GITHUB_ENV
+
+      # ── Mesa source ─────────────────────────────────────────────────────────
+      - name: Clone Mesa
+        run: |
+          BRANCH="${{ github.event.inputs.mesa_version }}"
+          BRANCH="${BRANCH:-main}"
+          git clone --depth=1 --branch "$BRANCH" \
+            https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_SRC" || \
+          git clone --depth=1 \
+            https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_SRC"
+
+      # ── Meson cross file for aarch64-android ────────────────────────────────
+      - name: Write Meson cross file
+        run: |
+          NDK="$NDK_HOME"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          TARGET="aarch64-linux-android"
+          API=27
+
+          cat > cross_android_aarch64.txt << EOF
+          [binaries]
+          ar        = '$TOOLCHAIN/bin/llvm-ar'
+          c         = '$TOOLCHAIN/bin/${TARGET}${API}-clang'
+          cpp       = '$TOOLCHAIN/bin/${TARGET}${API}-clang++'
+          strip     = '$TOOLCHAIN/bin/llvm-strip'
+          pkg-config= 'false'
+          llvm-config = 'false'
+
+          [host_machine]
+          system     = 'android'
+          cpu_family = 'aarch64'
+          cpu        = 'armv8'
+          endian     = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          EOF
+
+      # ── Configure Mesa (Turnip/Freedreno only) ───────────────────────────────
+      - name: Configure Mesa with Meson
+        run: |
+          mkdir -p build
+          meson setup build "$MESA_SRC" \
+            --cross-file cross_android_aarch64.txt \
+            --buildtype=release \
+            --strip \
+            -Dplatforms=android \
+            -Dandroid-stub=true \
+            -Dgallium-drivers= \
+            -Dvulkan-drivers=freedreno \
+            -Dfreedreno-kmds=kgsl \
+            -Dglx=disabled \
+            -Degl=disabled \
+            -Dgles1=disabled \
+            -Dgles2=disabled \
+            -Dllvm=disabled \
+            -Dshared-llvm=disabled \
+            -Dbuild-tests=false \
+            -Dtools= \
+            -Dzstd=disabled \
+            -Dxmlconfig=disabled \
+            -Dinstall-mesa-clc=false \
+            --prefix=/
+
+      # ── Build ────────────────────────────────────────────────────────────────
+      - name: Build Turnip
+        run: ninja -C build src/freedreno/vulkan/libvulkan_freedreno.so
+
+      # ── Package ──────────────────────────────────────────────────────────────
+      - name: Package AdrenoTools driver
+        run: |
+          mkdir -p "$OUT_DIR"
+
+          SO=$(find build -name "libvulkan_freedreno.so" | head -1)
+          cp "$SO" "$OUT_DIR/libvulkan_freedreno.so"
+
+          # Get Mesa version string from the source
+          MESA_VER=$(grep -m1 "version:" "$MESA_SRC/meson.build" | grep -oP "[0-9]+\.[0-9]+\.[0-9]+(-\w+)?" || echo "unknown")
+          DATE_TAG="${{ github.event.inputs.driver_label }}"
+          DATE_TAG="${DATE_TAG:-$(date +%Y-%m-%d)}"
+          RELEASE_NAME="Turnip-Adreno619-${DATE_TAG}"
+
+          cat > "$OUT_DIR/meta.json" << EOF
+          {
+            "schemaVersion": 1,
+            "name": "Turnip (Mesa ${MESA_VER})",
+            "description": "Mesa Turnip Vulkan driver for Adreno 619 (Snapdragon 695). Built from Mesa ${MESA_VER} on ${DATE_TAG}. Optimized for Winlator Bionic.",
+            "packageVersion": "1",
+            "vendor": "Mesa / freedesktop.org",
+            "driverVersion": "${MESA_VER}",
+            "minApi": 27,
+            "libraryName": "libvulkan_freedreno.so"
+          }
+          EOF
+
+          cd "$OUT_DIR"
+          zip -9 "${RELEASE_NAME}.zip" libvulkan_freedreno.so meta.json
+          echo "RELEASE_NAME=${RELEASE_NAME}" >> $GITHUB_ENV
+          echo "MESA_VER=${MESA_VER}" >> $GITHUB_ENV
+          echo "DATE_TAG=${DATE_TAG}" >> $GITHUB_ENV
+
+      # ── Upload artifact ───────────────────────────────────────────────────────
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: turnip-adreno619-driver
+          path: ${{ env.OUT_DIR }}/*.zip
+
+      # ── Create GitHub Release ─────────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "turnip-${{ env.DATE_TAG }}"
+          name: "Turnip ${{ env.MESA_VER }} — Adreno 619 (${{ env.DATE_TAG }})"
+          body: |
+            ## Turnip Vulkan Driver for Adreno 619 (Snapdragon 695)
+            
+            **Mesa version:** ${{ env.MESA_VER }}  
+            **Built:** ${{ env.DATE_TAG }}  
+            **Target GPU:** Adreno 619 (Snapdragon 695 — Redmi Note 11 Pro 5G)  
+            **API level:** Android 8.1+ (API 27+)
+            
+            ### Install in Winlator Bionic
+            1. Open Winlator → Settings → Graphics Driver
+            2. Tap **Install driver** and select the `.zip`
+            3. Set driver to **Turnip** in your container
+            
+            ### Recommended env vars
+            ```
+            DXVK_ASYNC=1
+            TU_DEBUG=noconform
+            MESA_VK_WSI_PRESENT_MODE=mailbox
+            GALLIUM_THREAD=1
+            ```
+            
+            Built by GitHub Actions from [Mesa](https://gitlab.freedesktop.org/mesa/mesa).
+          files: ${{ env.OUT_DIR }}/*.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
