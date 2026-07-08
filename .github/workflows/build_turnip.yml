@@ -3,17 +3,15 @@ name: Build Turnip Driver (Adreno 619 - SD695)
 on:
   workflow_dispatch:
     inputs:
-      mesa_version:
-        description: 'Mesa branch or tag (e.g. main, mesa-24.3.0)'
+      force_build:
+        description: "Force build even if no new Mesa commits"
         required: false
-        default: 'main'
-      driver_label:
-        description: 'Label suffix for the release (e.g. 2025-07-08)'
-        required: false
-        default: ''
+        default: "false"
+  schedule:
+    - cron: "0 */6 * * *"   # runs every 6 hours
 
 jobs:
-  build:
+  check-and-build:
     runs-on: ubuntu-24.04
     env:
       ANDROID_NDK_VERSION: r27c
@@ -24,8 +22,38 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ── Dependencies ────────────────────────────────────────────────────────
+      # ── Check if Mesa has new commits ────────────────────────────────────────
+      - name: Check Mesa for new commits
+        id: mesa_check
+        run: |
+          # Fetch latest commit SHA from Mesa main branch via GitLab API
+          LATEST_SHA=$(curl -s "https://gitlab.freedesktop.org/api/v4/projects/mesa%2Fmesa/repository/branches/main" \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['commit']['id'])")
+
+          echo "latest_sha=$LATEST_SHA" >> $GITHUB_OUTPUT
+
+          # Read stored SHA (empty if first run)
+          STORED_SHA=""
+          if [ -f last_mesa_commit.txt ]; then
+            STORED_SHA=$(cat last_mesa_commit.txt | tr -d "[:space:]")
+          fi
+
+          echo "stored_sha=$STORED_SHA" >> $GITHUB_OUTPUT
+          echo "Latest Mesa SHA : $LATEST_SHA"
+          echo "Last built SHA  : $STORED_SHA"
+
+          FORCE="${{ github.event.inputs.force_build }}"
+          if [ "$LATEST_SHA" = "$STORED_SHA" ] && [ "$FORCE" != "true" ]; then
+            echo "No new Mesa commits. Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          else
+            echo "New commits detected (or forced). Building!"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Install dependencies ─────────────────────────────────────────────────
       - name: Install build dependencies
+        if: steps.mesa_check.outputs.should_build == 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
@@ -36,39 +64,36 @@ jobs:
             pkg-config ca-certificates
           pip3 install meson --break-system-packages
 
-      # ── Android NDK ─────────────────────────────────────────────────────────
+      # ── Android NDK ──────────────────────────────────────────────────────────
       - name: Download Android NDK
+        if: steps.mesa_check.outputs.should_build == 'true'
         run: |
           wget -q "https://dl.google.com/android/repository/android-ndk-${ANDROID_NDK_VERSION}-linux.zip" -O ndk.zip
           unzip -q ndk.zip -d $HOME
           echo "NDK_HOME=$HOME/android-ndk-${ANDROID_NDK_VERSION}" >> $GITHUB_ENV
 
-      # ── Mesa source ─────────────────────────────────────────────────────────
+      # ── Clone Mesa ───────────────────────────────────────────────────────────
       - name: Clone Mesa
+        if: steps.mesa_check.outputs.should_build == 'true'
         run: |
-          BRANCH="${{ github.event.inputs.mesa_version }}"
-          BRANCH="${BRANCH:-main}"
-          git clone --depth=1 --branch "$BRANCH" \
-            https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_SRC" || \
-          git clone --depth=1 \
+          git clone --depth=1 --branch main \
             https://gitlab.freedesktop.org/mesa/mesa.git "$MESA_SRC"
 
-      # ── Meson cross file for aarch64-android ────────────────────────────────
+      # ── Meson cross file ─────────────────────────────────────────────────────
       - name: Write Meson cross file
+        if: steps.mesa_check.outputs.should_build == 'true'
         run: |
-          NDK="$NDK_HOME"
-          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64"
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
           TARGET="aarch64-linux-android"
           API=27
-
-          cat > cross_android_aarch64.txt << EOF
+          cat > cross_android_aarch64.txt << CROSSFILE
           [binaries]
-          ar        = '$TOOLCHAIN/bin/llvm-ar'
-          c         = '$TOOLCHAIN/bin/${TARGET}${API}-clang'
-          cpp       = '$TOOLCHAIN/bin/${TARGET}${API}-clang++'
-          strip     = '$TOOLCHAIN/bin/llvm-strip'
-          pkg-config= 'false'
-          llvm-config = 'false'
+          ar         = '${TOOLCHAIN}/bin/llvm-ar'
+          c          = '${TOOLCHAIN}/bin/${TARGET}${API}-clang'
+          cpp        = '${TOOLCHAIN}/bin/${TARGET}${API}-clang++'
+          strip      = '${TOOLCHAIN}/bin/llvm-strip'
+          pkg-config = 'false'
+          llvm-config= 'false'
 
           [host_machine]
           system     = 'android'
@@ -78,10 +103,11 @@ jobs:
 
           [properties]
           needs_exe_wrapper = true
-          EOF
+          CROSSFILE
 
-      # ── Configure Mesa (Turnip/Freedreno only) ───────────────────────────────
+      # ── Configure Mesa ───────────────────────────────────────────────────────
       - name: Configure Mesa with Meson
+        if: steps.mesa_check.outputs.should_build == 'true'
         run: |
           mkdir -p build
           meson setup build "$MESA_SRC" \
@@ -108,43 +134,46 @@ jobs:
 
       # ── Build ────────────────────────────────────────────────────────────────
       - name: Build Turnip
+        if: steps.mesa_check.outputs.should_build == 'true'
         run: ninja -C build src/freedreno/vulkan/libvulkan_freedreno.so
 
       # ── Package ──────────────────────────────────────────────────────────────
       - name: Package AdrenoTools driver
+        if: steps.mesa_check.outputs.should_build == 'true'
         run: |
           mkdir -p "$OUT_DIR"
-
           SO=$(find build -name "libvulkan_freedreno.so" | head -1)
           cp "$SO" "$OUT_DIR/libvulkan_freedreno.so"
 
-          # Get Mesa version string from the source
           MESA_VER=$(grep -m1 "version:" "$MESA_SRC/meson.build" | grep -oP "[0-9]+\.[0-9]+\.[0-9]+(-\w+)?" || echo "unknown")
-          DATE_TAG="${{ github.event.inputs.driver_label }}"
-          DATE_TAG="${DATE_TAG:-$(date +%Y-%m-%d)}"
+          DATE_TAG=$(date +%Y-%m-%d)
+          SHORT_SHA=$(echo "${{ steps.mesa_check.outputs.latest_sha }}" | cut -c1-8)
           RELEASE_NAME="Turnip-Adreno619-${DATE_TAG}"
 
-          cat > "$OUT_DIR/meta.json" << EOF
+          cat > "$OUT_DIR/meta.json" << METAEOF
           {
             "schemaVersion": 1,
-            "name": "Turnip (Mesa ${MESA_VER})",
-            "description": "Mesa Turnip Vulkan driver for Adreno 619 (Snapdragon 695). Built from Mesa ${MESA_VER} on ${DATE_TAG}. Optimized for Winlator Bionic.",
+            "name": "Turnip Mesa ${MESA_VER}",
+            "description": "Mesa Turnip Vulkan driver for Adreno 619 (Snapdragon 695). Mesa ${MESA_VER} commit ${SHORT_SHA}, built ${DATE_TAG}.",
             "packageVersion": "1",
-            "vendor": "Mesa / freedesktop.org",
+            "vendor": "Mesa",
             "driverVersion": "${MESA_VER}",
             "minApi": 27,
             "libraryName": "libvulkan_freedreno.so"
           }
-          EOF
+          METAEOF
 
           cd "$OUT_DIR"
           zip -9 "${RELEASE_NAME}.zip" libvulkan_freedreno.so meta.json
+
           echo "RELEASE_NAME=${RELEASE_NAME}" >> $GITHUB_ENV
-          echo "MESA_VER=${MESA_VER}" >> $GITHUB_ENV
-          echo "DATE_TAG=${DATE_TAG}" >> $GITHUB_ENV
+          echo "MESA_VER=${MESA_VER}"         >> $GITHUB_ENV
+          echo "DATE_TAG=${DATE_TAG}"         >> $GITHUB_ENV
+          echo "SHORT_SHA=${SHORT_SHA}"       >> $GITHUB_ENV
 
       # ── Upload artifact ───────────────────────────────────────────────────────
-      - name: Upload build artifact
+      - name: Upload artifact
+        if: steps.mesa_check.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: turnip-adreno619-driver
@@ -152,23 +181,24 @@ jobs:
 
       # ── Create GitHub Release ─────────────────────────────────────────────────
       - name: Create GitHub Release
+        if: steps.mesa_check.outputs.should_build == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: "turnip-${{ env.DATE_TAG }}"
+          tag_name: "turnip-${{ env.DATE_TAG }}-${{ env.SHORT_SHA }}"
           name: "Turnip ${{ env.MESA_VER }} — Adreno 619 (${{ env.DATE_TAG }})"
           body: |
             ## Turnip Vulkan Driver for Adreno 619 (Snapdragon 695)
-            
-            **Mesa version:** ${{ env.MESA_VER }}  
-            **Built:** ${{ env.DATE_TAG }}  
-            **Target GPU:** Adreno 619 (Snapdragon 695 — Redmi Note 11 Pro 5G)  
-            **API level:** Android 8.1+ (API 27+)
-            
+
+            **Mesa version:** ${{ env.MESA_VER }}
+            **Mesa commit:** ${{ steps.mesa_check.outputs.latest_sha }}
+            **Built:** ${{ env.DATE_TAG }}
+            **Target GPU:** Adreno 619 (Snapdragon 695 — Redmi Note 11 Pro 5G)
+            **Min API:** Android 8.1+ (API 27+)
+
             ### Install in Winlator Bionic
-            1. Open Winlator → Settings → Graphics Driver
-            2. Tap **Install driver** and select the `.zip`
-            3. Set driver to **Turnip** in your container
-            
+            1. Winlator → Settings → Graphics Driver → Install driver → pick the `.zip`
+            2. Set container driver to **Turnip**
+
             ### Recommended env vars
             ```
             DXVK_ASYNC=1
@@ -176,10 +206,39 @@ jobs:
             MESA_VK_WSI_PRESENT_MODE=mailbox
             GALLIUM_THREAD=1
             ```
-            
-            Built by GitHub Actions from [Mesa](https://gitlab.freedesktop.org/mesa/mesa).
           files: ${{ env.OUT_DIR }}/*.zip
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Save new Mesa SHA so we dont rebuild the same commit ─────────────────
+      - name: Update last_mesa_commit.txt
+        if: steps.mesa_check.outputs.should_build == 'true'
+        run: |
+          LATEST="${{ steps.mesa_check.outputs.latest_sha }}"
+          echo "$LATEST" > last_mesa_commit.txt
+
+          # Get current file SHA if it exists
+          FILE_SHA=$(curl -s \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/last_mesa_commit.txt" \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('sha',''))" 2>/dev/null || echo "")
+
+          CONTENT=$(echo -n "$LATEST" | base64 -w0)
+
+          if [ -n "$FILE_SHA" ]; then
+            curl -s -X PUT \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/contents/last_mesa_commit.txt" \
+              -d "{\"message\":\"chore: update last built Mesa commit\",\"content\":\"${CONTENT}\",\"sha\":\"${FILE_SHA}\"}" > /dev/null
+          else
+            curl -s -X PUT \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              "https://api.github.com/repos/${{ github.repository }}/contents/last_mesa_commit.txt" \
+              -d "{\"message\":\"chore: init last built Mesa commit\",\"content\":\"${CONTENT}\"}" > /dev/null
+          fi
+          echo "Saved Mesa SHA: $LATEST"
+
