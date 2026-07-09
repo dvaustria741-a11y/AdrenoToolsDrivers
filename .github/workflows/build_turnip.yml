@@ -85,7 +85,7 @@ jobs:
         run: |
           TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
           TARGET="aarch64-linux-android"
-          API=27
+          API=29
           cat > cross_android_aarch64.txt << CROSSFILE
           [binaries]
           ar         = '${TOOLCHAIN}/bin/llvm-ar'
@@ -241,4 +241,3 @@ jobs:
               -d "{\"message\":\"chore: init last built Mesa commit\",\"content\":\"${CONTENT}\"}" > /dev/null
           fi
           echo "Saved Mesa SHA: $LATEST"
-
