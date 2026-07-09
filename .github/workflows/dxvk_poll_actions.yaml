@@ -1,8 +1,12 @@
-name: DXVK Workflow Runs
+name: Notify - Workflow Runs
 
 on:
   schedule:
     - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   monitor:
@@ -14,41 +18,49 @@ jobs:
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y jq
 
-      - name: Get last sent run ID
+      - name: Get last notified run ID
         id: get_last_id
         run: |
-          LAST_ID=$(cat last_dxvk_run_id.txt 2>/dev/null | tr -d "[:space:]" || echo "0")
+          LAST_ID=$(cat last_own_run_id.txt 2>/dev/null | tr -d "[:space:]")
           [ -z "$LAST_ID" ] && LAST_ID=0
           echo "last_id=$LAST_ID" >> $GITHUB_OUTPUT
 
-      - name: Fetch recent workflow runs from doitsujin/dxvk
+      - name: Fetch recent workflow runs
         run: |
-          curl -s -H "Accept: application/vnd.github+json" \
+          curl -s \
+            -H "Accept: application/vnd.github+json" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/doitsujin/dxvk/actions/runs?per_page=20" > runs.json
+            "https://api.github.com/repos/dvaustria741-a11y/AdrenoToolsDrivers/actions/runs?per_page=20" > runs.json
 
-      - name: Process and notify on new successful push-triggered runs
+      - name: Notify on new completed runs
         env:
           WEBHOOK_URL: ${{ secrets.DXVK_WEBHOOK }}
           LAST_ID: ${{ steps.get_last_id.outputs.last_id }}
         run: |
-          NEW_RUNS=$(jq "[.workflow_runs[] | select(.status==\"completed\" and .conclusion==\"success\" and .event==\"push\" and .id > $LAST_ID) | {id: .id, url: .html_url}] | sort_by(.id)" runs.json)
-          COUNT=$(echo "$NEW_RUNS" | jq "length")
-          if [ "$COUNT" -gt 0 ] && [ -n "$WEBHOOK_URL" ]; then
-            MAX_ID=0
+          NEW=$(jq "[.workflow_runs[] | select(.status==\"completed\" and .id > ($LAST_ID | tonumber)) | {id:.id, name:.name, conclusion:.conclusion, url:.html_url}] | sort_by(.id)" runs.json)
+          COUNT=$(echo "$NEW" | jq "length")
+          echo "New runs: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
+            MAX_ID=$LAST_ID
             for i in $(seq 0 $(($COUNT - 1))); do
-              RUN_ID=$(echo "$NEW_RUNS" | jq -r ".[$i].id")
-              RUN_URL=$(echo "$NEW_RUNS" | jq -r ".[$i].url")
-              curl -sf -H "Content-Type: application/json" \
-                -d "{\"content\": \"$RUN_URL\"}" "$WEBHOOK_URL" || true
+              RUN_ID=$(echo "$NEW" | jq -r ".[$i].id")
+              RUN_NAME=$(echo "$NEW" | jq -r ".[$i].name")
+              RUN_STATUS=$(echo "$NEW" | jq -r ".[$i].conclusion")
+              RUN_URL=$(echo "$NEW" | jq -r ".[$i].url")
+              ICON="✅"
+              [ "$RUN_STATUS" != "success" ] && ICON="❌"
+              if [ -n "$WEBHOOK_URL" ]; then
+                curl -sf -H "Content-Type: application/json" \
+                  -d "{\"content\": \"$ICON **${RUN_NAME}** → ${RUN_STATUS}\n${RUN_URL}\"}" \
+                  "$WEBHOOK_URL" || true
+              fi
               [ "$RUN_ID" -gt "$MAX_ID" ] && MAX_ID=$RUN_ID
             done
-            echo "$MAX_ID" > last_dxvk_run_id.txt
-            git config --global user.name "GitHub Actions"
-            git config --global user.email "actions@github.com"
-            git add last_dxvk_run_id.txt
-            git commit -m "chore: update last DXVK run ID"
-            git pull --rebase origin HEAD || true
+            echo "$MAX_ID" > last_own_run_id.txt
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git add last_own_run_id.txt
+            git diff --cached --quiet || git commit -m "chore: update last notified run ID"
+            git pull --rebase origin main || git pull --rebase origin master || true
             git push
           fi
-
