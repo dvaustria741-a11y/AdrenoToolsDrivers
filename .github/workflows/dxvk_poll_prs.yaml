@@ -1,8 +1,12 @@
-name: DXVK Pull Request Monitor
+name: Notify - Pull Requests
 
 on:
   schedule:
     - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   monitor:
@@ -14,42 +18,46 @@ jobs:
       - name: Install jq
         run: sudo apt-get update -qq && sudo apt-get install -y jq
 
-      - name: Get last sent PR ID
+      - name: Get last notified PR ID
         id: get_last_id
         run: |
-          FILE="last_dxvk_pr_id.txt"
-          LAST_ID=$(cat "$FILE" 2>/dev/null | tr -d "[:space:]" || echo "0")
+          LAST_ID=$(cat last_own_pr_id.txt 2>/dev/null | tr -d "[:space:]")
           [ -z "$LAST_ID" ] && LAST_ID=0
           echo "last_id=$LAST_ID" >> $GITHUB_OUTPUT
 
-      - name: Fetch recent pull requests from doitsujin/dxvk
+      - name: Fetch recent pull requests
         run: |
-          curl -s -H "Accept: application/vnd.github+json" \
+          curl -s \
+            -H "Accept: application/vnd.github+json" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            "https://api.github.com/repos/doitsujin/dxvk/pulls?per_page=30&state=all" > prs.json
+            "https://api.github.com/repos/dvaustria741-a11y/AdrenoToolsDrivers/pulls?per_page=20&state=all" > prs.json
 
-      - name: Process and notify on new pull requests
+      - name: Notify on new PRs
         env:
           WEBHOOK_URL: ${{ secrets.DXVK_WEBHOOK }}
           LAST_ID: ${{ steps.get_last_id.outputs.last_id }}
         run: |
-          NEW_PRS=$(jq "[.[] | select(.id > $LAST_ID) | {id: .id, url: .html_url}] | sort_by(.id)" prs.json)
-          COUNT=$(echo "$NEW_PRS" | jq "length")
-          if [ "$COUNT" -gt 0 ] && [ -n "$WEBHOOK_URL" ]; then
+          NEW=$(jq "[.[] | select(.id > ($LAST_ID | tonumber)) | {id:.id, title:.title, url:.html_url}] | sort_by(.id)" prs.json)
+          COUNT=$(echo "$NEW" | jq "length")
+          echo "New PRs: $COUNT"
+          if [ "$COUNT" -gt 0 ]; then
             MAX_ID=$LAST_ID
             for i in $(seq 0 $(($COUNT - 1))); do
-              PR_ID=$(echo "$NEW_PRS" | jq -r ".[$i].id")
-              PR_URL=$(echo "$NEW_PRS" | jq -r ".[$i].url")
-              curl -sf -H "Content-Type: application/json" \
-                -d "{\"content\": \"$PR_URL\"}" "$WEBHOOK_URL" || true
+              PR_ID=$(echo "$NEW" | jq -r ".[$i].id")
+              PR_TITLE=$(echo "$NEW" | jq -r ".[$i].title")
+              PR_URL=$(echo "$NEW" | jq -r ".[$i].url")
+              if [ -n "$WEBHOOK_URL" ]; then
+                curl -sf -H "Content-Type: application/json" \
+                  -d "{\"content\": \"🔀 **New PR:** ${PR_TITLE}\n${PR_URL}\"}" \
+                  "$WEBHOOK_URL" || true
+              fi
               [ "$PR_ID" -gt "$MAX_ID" ] && MAX_ID=$PR_ID
             done
-            echo "$MAX_ID" > last_dxvk_pr_id.txt
-            git config --global user.name "GitHub Actions"
-            git config --global user.email "actions@github.com"
-            git add last_dxvk_pr_id.txt
-            git commit -m "chore: update last DXVK PR ID"
-            git pull --rebase origin HEAD || true
+            echo "$MAX_ID" > last_own_pr_id.txt
+            git config --global user.name "github-actions[bot]"
+            git config --global user.email "github-actions[bot]@users.noreply.github.com"
+            git add last_own_pr_id.txt
+            git diff --cached --quiet || git commit -m "chore: update last notified PR ID"
+            git pull --rebase origin main || git pull --rebase origin master || true
             git push
           fi
-
