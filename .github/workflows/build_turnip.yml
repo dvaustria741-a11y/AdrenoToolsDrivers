@@ -13,6 +13,8 @@ on:
 jobs:
   check-and-build:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     env:
       ANDROID_NDK_VERSION: r27c
       MESA_SRC: ${{ github.workspace }}/mesa
